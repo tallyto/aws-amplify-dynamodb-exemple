@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Sample SAM Template for augmented-reality-back-end
+  
+Parameters:
+  APIName:
+    Description: augmented-reality-back-end
+    Type: String
+    Default: augmented_reality_back_end
+
+Resources:
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref APIName
+      ProvisionedThroughput:
+        WriteCapacityUnits: 5
+        ReadCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: "code"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "code"
+          KeyType: "HASH"
+  
+  PolicyDynamoDB:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Path: /service-role/
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:Query
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:DeleteItem
+            Resource:
+              - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DynamoDBTable}
+  
+  RoleAppSyncDynamoDB:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - !Ref PolicyDynamoDB
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - appsync.amazonaws.com
+  
+  RoleAppSyncCloudWatch:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSAppSyncPushToCloudWatchLogs"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - appsync.amazonaws.com
+  
+  GraphQLApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Ref APIName
+      AuthenticationType: API_KEY
+      LogConfig:
+        CloudWatchLogsRoleArn: !GetAtt RoleAppSyncCloudWatch.Arn
+        ExcludeVerboseContent: FALSE
+        FieldLogLevel: ALL
+
+  GraphQLApiSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Definition: |
+        schema {
+          query: Query
+          mutation: Mutation
+        }
+        input SaveTarget {
+          code: String!
+          name: String!
+          description: String
+          extFile: String!
+        }
+        type DataTarget {
+          code: String!
+          name: String!
+          description: String
+          extFile: String!
+        }      
+        type DataCollection {
+          items: [DataTarget]
+          nextToken: String
+        }        
+        type Mutation {
+          writeData(input: SaveTarget!): DataTarget
+          updateData(input: SaveTarget!): DataTarget
+          deleteData(code: String!): DataTarget
+        }
+        type Query {
+          readData(code: String!): DataTarget
+          readAllData(code: String): DataCollection
+        }
+  
+  GraphQLDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Name: !Ref APIName
+      Type: AMAZON_DYNAMODB
+      ServiceRoleArn: !GetAtt RoleAppSyncDynamoDB.Arn
+      DynamoDBConfig: 
+        TableName: !Ref DynamoDBTable
+        AwsRegion: !Sub ${AWS::Region}
+
+  AppSyncResolverReadData:
+    Type: AWS::AppSync::Resolver
+    DependsOn: GraphQLApiSchema
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Query
+      FieldName: readData
+      DataSourceName: !GetAtt GraphQLDataSource.Name
+      RequestMappingTemplate: >
+        {
+          "version": "2017-02-28",
+          "operation": "GetItem",
+          "key": {
+            "code": $util.dynamodb.toDynamoDBJson($ctx.args.code),
+          },
+        }
+      ResponseMappingTemplate: $util.toJson($context.result)
+
+  AppSyncResolverReadAllData:
+    Type: AWS::AppSync::Resolver
+    DependsOn: GraphQLApiSchema
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Query
+      FieldName: readAllData
+      DataSourceName: !GetAtt GraphQLDataSource.Name
+      RequestMappingTemplate: >
+        {
+            "version" : "2017-02-28",
+            "operation" : "Query",
+            "query" : {
+                "expression": "code = :code",
+                "expressionValues" : {
+                    ":code" : $util.dynamodb.toDynamoDBJson($ctx.args.code),
+                }
+            }
+        }
+      ResponseMappingTemplate: $util.toJson($context.result)
+
+  AppSyncResolverWriteData:
+    Type: AWS::AppSync::Resolver
+    DependsOn: GraphQLApiSchema
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Mutation
+      FieldName: writeData
+      DataSourceName: !GetAtt GraphQLDataSource.Name
+      RequestMappingTemplate: >
+        {
+          "version": "2017-02-28",
+          "operation": "PutItem",
+          "key": {
+            "code": $util.dynamodb.toDynamoDBJson($ctx.args.input.code),
+          },
+          "attributeValues": $util.dynamodb.toMapValuesJson($ctx.args.input),
+          "condition": {
+            "expression": "attribute_not_exists(#code)",
+            "expressionNames": {
+              "#code": "code",
+            },
+          },
+        }
+      ResponseMappingTemplate: $util.toJson($context.result)
+
+  AppSyncResolverUpdateData:
+    Type: AWS::AppSync::Resolver
+    DependsOn: GraphQLApiSchema
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Mutation
+      FieldName: updateData
+      DataSourceName: !GetAtt GraphQLDataSource.Name
+      RequestMappingTemplate: >
+        {
+          "version": "2017-02-28",
+          "operation": "PutItem",
+          "key": {
+            "code": $util.dynamodb.toDynamoDBJson($ctx.args.input.code),
+          },
+          "attributeValues": $util.dynamodb.toMapValuesJson($ctx.args.input),
+        }
+      ResponseMappingTemplate: $util.toJson($context.result)
+
+  AppSyncResolverDeleteData:
+    Type: AWS::AppSync::Resolver
+    DependsOn: GraphQLApiSchema
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Mutation
+      FieldName: deleteData
+      DataSourceName: !GetAtt GraphQLDataSource.Name
+      RequestMappingTemplate: >
+        {
+          "version": "2017-02-28",
+          "operation": "DeleteItem",
+          "key": {
+            "code": $util.dynamodb.toDynamoDBJson($ctx.args.code),
+          },
+        }
+      ResponseMappingTemplate: $util.toJson($context.result)
+
+  AppSyncAPIKey:
+      Type: AWS::AppSync::ApiKey
+      Properties:
+        ApiId: !GetAtt GraphQLApi.ApiId
+
+Outputs:
+  APIKey:
+    Description: API Key
+    Value: !GetAtt AppSyncAPIKey.ApiKey
+
+  GraphQL:
+    Description: GraphQL URL
+    Value: !GetAtt GraphQLApi.GraphQLUrl
